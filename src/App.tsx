@@ -117,7 +117,7 @@ export default function App() {
         {/* Header */}
         <header className="flex flex-col md:flex-row items-center justify-between border-b border-stone-900 pb-6 mb-6">
             <div>
-                <span className="text-[10px] uppercase tracking-widest font-bold opacity-60">Econometric Analysis Suite v4.1</span>
+                <span className="text-[10px] uppercase tracking-widest font-bold opacity-60">Econometric Analysis Suite v4.1 &bull; Created by Alane Gaetan Foudjin</span>
                 <h1 className="font-serif italic text-3xl leading-none -mt-1 flex items-center gap-2">
                     Engle-Granger Diagnostics
                 </h1>
@@ -460,13 +460,15 @@ export default function App() {
         </div>
 
         {/* Footer Metric Bar */}
-        <footer className="mt-8 flex items-center justify-between px-6 py-2 border-t border-stone-900 bg-stone-200 text-[10px] font-mono mx-[-1.5rem] mb-[-1.5rem] sm:mx-[-1.5rem] sm:mb-[-1.5rem]">
-            <div className="flex gap-4">
+        <footer className="mt-8 flex flex-col sm:flex-row items-center justify-between px-6 py-2 border-t border-stone-900 bg-stone-200 text-[10px] font-mono mx-[-1.5rem] mb-[-1.5rem] sm:mx-[-1.5rem] sm:mb-[-1.5rem] gap-2">
+            <div className="flex flex-wrap justify-center sm:justify-start gap-4">
                 <span className="font-bold text-stone-700">[ENGINE: PYODIDE 0.29.3]</span>
-                <span className="text-stone-400">|</span>
+                <span className="text-stone-400 hidden sm:inline">|</span>
                 <span className="font-bold text-stone-700">[REACT: 19.x]</span>
+                <span className="text-stone-400 hidden sm:inline">|</span>
+                <span className="font-bold text-stone-700 uppercase">[PUBLISHED BY: ALANE GAETAN FOUDJIN]</span>
             </div>
-            <div className="tracking-widest font-bold text-stone-700">
+            <div className="tracking-widest font-bold text-stone-700 text-center sm:text-right uppercase">
                 ENGL_GRANGER_DIAGNOSTIC_SUITE
             </div>
         </footer>
