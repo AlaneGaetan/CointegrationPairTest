@@ -1,0 +1,6 @@
+{
+  "name": "Cointegration Diagnostics Tool",
+  "description": "A Python-powered web diagnostic tool for identifying cointegrated asset pairs using the Engle-Granger Two-Step Method via Pyodide.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
