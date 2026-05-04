@@ -88,10 +88,13 @@ export interface BacktestResult {
     total_return: number;
     sharpe_ratio: number;
     max_drawdown: number;
+    max_drawdown_duration: number;
+    trades_count: number;
     daily_returns: number[];
     cumulative_returns: number[];
     positions: number[];
     z_score: number[];
+    spread_series: number[];
 }
 
 export interface CointegrationResult {
@@ -103,7 +106,11 @@ export interface CointegrationResult {
     backtest: BacktestResult;
 }
 
-export async function checkCointegration(y: number[], x: number[]): Promise<CointegrationResult> {
+export async function checkCointegration(
+    y: number[], 
+    x: number[],
+    backtestParams = { betaMode: 'constant' as 'constant' | 'rolling', betaWindow: 60, zscoreWindow: 20, leverage: 1, transactionCost: 0.001 }
+): Promise<CointegrationResult> {
     emitLog("Starting diagnostics...");
     const pyodide = await initPyodide();
     
@@ -118,7 +125,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
-def run_test(y_data, x_data):
+def run_test(y_data, x_data, beta_mode, beta_window, zscore_window, leverage, tc):
     try:
         y = pd.Series(y_data)
         x = pd.Series(x_data)
@@ -193,22 +200,48 @@ def run_test(y_data, x_data):
              johansen_res = {"error": str(e)}
 
         # Backtest module
-        def run_backtest(y, x, beta, spread_list):
-            spread_series = pd.Series(spread_list)
+        def run_backtest(y, x, const_beta, const_spread, b_mode, b_win, z_win, lev, tc_rate):
             y_series = pd.Series(y)
             x_series = pd.Series(x)
             
-            # Simple Z-score
-            rolling_mean = spread_series.rolling(window=20).mean()
-            rolling_std = spread_series.rolling(window=20).std()
+            exposure_beta = pd.Series(const_beta, index=y_series.index)
+            spread_series = pd.Series(const_spread)
+            
+            if b_mode == "rolling":
+                dynamic_spread = pd.Series(np.nan, index=y_series.index)
+                rolling_beta = pd.Series(np.nan, index=y_series.index)
+                
+                # We need at least b_win points
+                for i in range(int(b_win), len(y_series)):
+                    y_win = y_series.iloc[i-int(b_win):i]
+                    x_win = x_series.iloc[i-int(b_win):i]
+                    X_win = sm.add_constant(x_win)
+                    try:
+                        model = sm.OLS(y_win, X_win).fit()
+                        a = model.params.iloc[0]
+                        b = model.params.iloc[1]
+                        
+                        rolling_beta.iloc[i] = b
+                        # spread is realized out-of-sample today
+                        dynamic_spread.iloc[i] = y_series.iloc[i] - (a + b * x_series.iloc[i])
+                    except:
+                        pass
+                        
+                # Fill initial nan with full-sample values just to avoid cutting series length 
+                # or just leave them as NaN and positions won't trigger
+                spread_series = dynamic_spread
+                exposure_beta = rolling_beta
+                
+            rolling_mean = spread_series.rolling(window=int(z_win)).mean()
+            rolling_std = spread_series.rolling(window=int(z_win)).std()
             z_score = (spread_series - rolling_mean) / rolling_std
             
-            positions = np.zeros(len(spread_list))
+            positions = np.zeros(len(spread_series))
             current_pos = 0
             
             for i in range(len(z_score)):
                 z = z_score.iloc[i]
-                if np.isnan(z):
+                if pd.isna(z) or np.isnan(z):
                     positions[i] = 0
                     continue
                     
@@ -226,12 +259,23 @@ def run_test(y_data, x_data):
             pos_series = pd.Series(positions).shift(1).fillna(0)
             spread_diff = spread_series.diff()
             
-            # Gross exposure: Price of Y + beta * Price of X
-            capital = y_series.shift(1) + abs(beta) * x_series.shift(1)
+            # Gross exposure: Price of Y + |beta| * Price of X
+            capital_exposure = exposure_beta.shift(1).abs()
+            capital_exposure = capital_exposure.fillna(method='bfill').fillna(const_beta) # fallback
+            capital = y_series.shift(1) + capital_exposure * x_series.shift(1)
             capital[capital == 0] = 1 # Avoid division by zero
+            capital = capital.fillna(method='bfill').fillna(1)
             
-            daily_pnl = pos_series * spread_diff
-            daily_ret = (daily_pnl / capital).fillna(0)
+            # Calculate trades and fees
+            pos_changes = pos_series.diff().fillna(0)
+            num_trades = int((pos_changes != 0).sum())
+            
+            # Transaction costs applied as percentage to notional value swapped
+            notional_traded = pos_changes.abs() * capital
+            tc_amount = notional_traded * float(tc_rate)
+            
+            daily_pnl = pos_series * spread_diff - tc_amount
+            daily_ret = (daily_pnl / capital).fillna(0) * float(lev)
             
             cum_ret = (1 + daily_ret).cumprod()
             total_ret = cum_ret.iloc[-1] - 1 if len(cum_ret) > 0 else 0.0
@@ -244,17 +288,30 @@ def run_test(y_data, x_data):
             drawdowns = cum_ret / rolling_max - 1
             max_dd = drawdowns.min() if len(drawdowns) > 0 else 0.0
             
+            dd_duration = np.zeros(len(cum_ret))
+            curr_duration = 0
+            for i in range(len(cum_ret)):
+                if cum_ret.iloc[i] >= rolling_max.iloc[i]:
+                    curr_duration = 0
+                else:
+                    curr_duration += 1
+                dd_duration[i] = curr_duration
+            max_dd_duration = float(np.max(dd_duration)) if len(dd_duration) > 0 else 0.0
+            
             return {
                 "total_return": float(total_ret),
                 "sharpe_ratio": float(sharpe),
                 "max_drawdown": float(max_dd),
+                "max_drawdown_duration": max_dd_duration,
+                "trades_count": num_trades,
                 "daily_returns": daily_ret.tolist(),
                 "cumulative_returns": cum_ret.tolist(),
                 "positions": positions.tolist(),
-                "z_score": z_score.fillna(0).tolist()
+                "z_score": z_score.fillna(0).tolist(),
+                "spread_series": spread_series.fillna(0).tolist()
             }
 
-        bt_res = run_backtest(y, x, eg_y_on_x['beta'], eg_y_on_x['residuals'])
+        bt_res = run_backtest(y, x, eg_y_on_x['beta'], eg_y_on_x['residuals'], beta_mode, beta_window, zscore_window, leverage, tc)
 
         return json.dumps({
             "success": True,
@@ -266,15 +323,21 @@ def run_test(y_data, x_data):
             "backtest": bt_res
         })
     except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
+        import traceback
+        return json.dumps({"success": False, "error": str(e), "trace": traceback.format_exc()})
 
-run_test(y_data_in, x_data_in)
+run_test(y_data_in, x_data_in, beta_mode_in, beta_window_in, zscore_window_in, leverage_in, tc_in)
 `;
 
 
     // Pass data into python scope
     pyodide.globals.set("y_data_in", pyodide.toPy(y));
     pyodide.globals.set("x_data_in", pyodide.toPy(x));
+    pyodide.globals.set("beta_mode_in", backtestParams.betaMode);
+    pyodide.globals.set("beta_window_in", backtestParams.betaWindow);
+    pyodide.globals.set("zscore_window_in", backtestParams.zscoreWindow);
+    pyodide.globals.set("leverage_in", backtestParams.leverage);
+    pyodide.globals.set("tc_in", backtestParams.transactionCost);
     
     // Execute python script
     const resultStr = await pyodide.runPythonAsync(pythonCode);
@@ -282,6 +345,11 @@ run_test(y_data_in, x_data_in)
     // Cleanup reference variables to avoid memory leaks in WebAssembly
     pyodide.globals.delete("y_data_in");
     pyodide.globals.delete("x_data_in");
+    pyodide.globals.delete("beta_mode_in");
+    pyodide.globals.delete("beta_window_in");
+    pyodide.globals.delete("zscore_window_in");
+    pyodide.globals.delete("leverage_in");
+    pyodide.globals.delete("tc_in");
     
     const result = JSON.parse(resultStr);
     

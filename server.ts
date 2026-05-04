@@ -15,21 +15,51 @@ async function startServer() {
   // API Route: Fetch Market Data
   app.post("/api/market-data", async (req, res) => {
     try {
-      const { ticker1, ticker2 } = req.body;
+      const { ticker1, ticker2, period1, period2 } = req.body;
       
       if (!ticker1 || !ticker2) {
         res.status(400).json({ error: "Missing tickers" });
         return;
       }
       
-      // Fetch past 5 years of daily data for a robust cointegration test
-      const period1 = new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-      const queryOptions = { period1, interval: "1d" };
+      const p1 = period1 ? period1 : new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const queryOptions: any = { period1: p1, interval: "1d" };
+      if (period2) {
+          queryOptions.period2 = period2;
+      }
       
-      const [res1, res2] = await Promise.all([
-        yf.chart(ticker1, queryOptions as any),
-        yf.chart(ticker2, queryOptions as any)
-      ]);
+      let res1, res2, resB;
+      try {
+          res1 = await yf.chart(ticker1, queryOptions as any);
+      } catch (e: any) {
+          if (e.message.includes("Data doesn't exist for startDate")) {
+              try {
+                  res1 = await yf.chart(ticker1, { period1: "1970-01-01", interval: "1d" } as any); // Fallback to all available
+              } catch (fallbackErr: any) {
+                  return res.status(400).json({ error: `Failed to fetch data for ${ticker1}: ${e.message}. Fallback also failed: ${fallbackErr.message}` });
+              }
+          } else {
+              return res.status(400).json({ error: `Failed to fetch data for ${ticker1}: ${e.message}` });
+          }
+      }
+      try {
+          res2 = await yf.chart(ticker2, queryOptions as any);
+      } catch (e: any) {
+          if (e.message.includes("Data doesn't exist for startDate")) {
+               try {
+                  res2 = await yf.chart(ticker2, { period1: "1970-01-01", interval: "1d" } as any); // Fallback to all available
+              } catch (fallbackErr: any) {
+                  return res.status(400).json({ error: `Failed to fetch data for ${ticker2}: ${e.message}. Fallback also failed.` });
+              }
+          } else {
+              return res.status(400).json({ error: `Failed to fetch data for ${ticker2}: ${e.message}` });
+          }
+      }
+      try {
+          resB = await yf.chart('QQQ', queryOptions as any);
+      } catch (e: any) {
+          return res.status(400).json({ error: `Failed to fetch data for QQQ (benchmark): ${e.message}` });
+      }
       
       // Map data by date (as string YYYY-MM-DD for precise alignment)
       const map1 = new Map<string, number>();
@@ -45,27 +75,37 @@ async function startServer() {
         const d = new Date(r.date).toISOString().split("T")[0];
         if (r.adjclose !== null && r.adjclose !== undefined) map2.set(d, r.adjclose);
       });
+
+      const mapB = new Map<string, number>();
+      resB.quotes.forEach((r: any) => {
+        if (!r.date) return;
+        const d = new Date(r.date).toISOString().split("T")[0];
+        if (r.adjclose !== null && r.adjclose !== undefined) mapB.set(d, r.adjclose);
+      });
       
       // Find common dates and keep chronological order
       const commonDates = [];
       const values1 = [];
       const values2 = [];
+      const valuesB = [];
       
       // Iterate through the dates we got for ticker1
       for (const r of res1.quotes) {
           if (!r.date) continue;
           const d = new Date(r.date).toISOString().split("T")[0];
-          if (map1.has(d) && map2.has(d)) {
+          if (map1.has(d) && map2.has(d) && mapB.has(d)) {
               commonDates.push(d);
               values1.push(map1.get(d));
               values2.push(map2.get(d));
+              valuesB.push(mapB.get(d));
           }
       }
       
       res.json({
           dates: commonDates,
-          y: values1, // Dependent
-          x: values2  // Independent
+          y: values1,
+          x: values2,
+          b: valuesB
       });
 
     } catch (err: any) {

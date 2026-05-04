@@ -1,12 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
+import Papa from 'papaparse';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
-import { Activity, Play, AlertCircle, CheckCircle, Upload, Check, Settings2 } from 'lucide-react';
+import { Activity, Play, AlertCircle, CheckCircle, Upload, Check, Settings2, FileBarChart } from 'lucide-react';
 import { checkCointegration, CointegrationResult, onLog, initPyodide } from './services/cointegration';
 import { cn } from './lib/utils';
 
 export default function App() {
-  const [tickerY, setTickerY] = useState<string>('AAPL');
-  const [tickerX, setTickerX] = useState<string>('MSFT');
+  const [tickerY, setTickerY] = useState<string>('BMNR');
+  const [tickerX, setTickerX] = useState<string>('ETH-USD');
+  const [dataSource, setDataSource] = useState<'yahoo' | 'csv'>('yahoo');
+  const [csvDataY, setCsvDataY] = useState<File | null>(null);
+  const [csvDataX, setCsvDataX] = useState<File | null>(null);
+  const [period1, setPeriod1] = useState<string>('2023-01-01');
+  const [period2, setPeriod2] = useState<string>('2024-12-31');
   const [logs, setLogs] = useState<string[]>([]);
   const [isInitializing, setIsInitializing] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
@@ -15,7 +21,15 @@ export default function App() {
   
   const [fetchedDataX, setFetchedDataX] = useState<number[]>([]);
   const [fetchedDataY, setFetchedDataY] = useState<number[]>([]);
+  const [fetchedDataB, setFetchedDataB] = useState<number[]>([]);
   const [fetchedDates, setFetchedDates] = useState<string[]>([]);
+
+  // Backtest Config State
+  const [betaMode, setBetaMode] = useState<'constant' | 'rolling'>('rolling');
+  const [betaWindow, setBetaWindow] = useState<string>('60');
+  const [zscoreWindow, setZscoreWindow] = useState<string>('20');
+  const [leverage, setLeverage] = useState<string>('1');
+  const [transactionCost, setTransactionCost] = useState<number>(0.1);
   
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -45,33 +59,90 @@ export default function App() {
       setResult(null);
       setErrorMsg(null);
       
-      const cleanY = tickerY.trim().toUpperCase();
-      const cleanX = tickerX.trim().toUpperCase();
+      const cleanY = tickerY.trim().toUpperCase() || 'Y';
+      const cleanX = tickerX.trim().toUpperCase() || 'X';
       
-      if (!cleanY || !cleanX) {
-          setErrorMsg('Error: Please provide both tickers.');
-          return;
-      }
-
       setIsRunning(true);
-      setLogs(['Fetching historical data (5 years) from Yahoo Finance...']);
+      
       try {
-          // Fetch data from backend
-          const res = await fetch('/api/market-data', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ticker1: cleanY, ticker2: cleanX })
-          });
-          
-          if (!res.ok) {
-            const errData = await res.json().catch(() => null);
-            throw new Error((errData && errData.error) || 'Failed to fetch market data');
+          let yArr: number[] = [];
+          let xArr: number[] = [];
+          let bArr: number[] = [];
+          let datesArr: string[] = [];
+
+          if (dataSource === 'yahoo') {
+              if (!cleanY || !cleanX) {
+                  throw new Error('Please provide both tickers.');
+              }
+              setLogs([`Fetching historical data from ${period1} to ${period2} from Yahoo Finance...`]);
+              const res = await fetch('/api/market-data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ticker1: cleanY, ticker2: cleanX, period1, period2 })
+              });
+              
+              if (!res.ok) {
+                const errData = await res.json().catch(() => null);
+                if (errData?.error && errData.error.includes("Data doesn't exist for startDate")) {
+                    throw new Error(`Data is missing on Yahoo Finance for the requested period. This typically happens for recently uplisted OTC stocks (like BMNR). Please use the CSV Upload feature instead to supply the historical data.`);
+                }
+                throw new Error((errData && errData.error) || 'Failed to fetch market data');
+              }
+              
+              const data = await res.json();
+              yArr = data.y;
+              xArr = data.x;
+              bArr = data.b;
+              datesArr = data.dates;
+          } else {
+              setLogs([`Parsing uploaded CSV files...`]);
+              if (!csvDataY || !csvDataX) {
+                  throw new Error('Please upload CSV files for both Asset Y and Asset X.');
+              }
+
+              const parseCSV = (file: File): Promise<any[]> => {
+                  return new Promise((resolve, reject) => {
+                      Papa.parse(file, {
+                          header: true,
+                          skipEmptyLines: true,
+                          complete: (results) => resolve(results.data),
+                          error: (error) => reject(error)
+                      });
+                  });
+              };
+
+              const [parsedY, parsedX] = await Promise.all([
+                  parseCSV(csvDataY),
+                  parseCSV(csvDataX)
+              ]);
+
+              const mapY = new Map();
+              parsedY.forEach(row => {
+                  const d = row['Date'] || row['date'];
+                  const val = parseFloat(row['Adj Close'] || row['Close'] || row['close']);
+                  if (d && !isNaN(val)) mapY.set(d.split('T')[0], val);
+              });
+
+              const mapX = new Map();
+              parsedX.forEach(row => {
+                  const d = row['Date'] || row['date'];
+                  const val = parseFloat(row['Adj Close'] || row['Close'] || row['close']);
+                  if (d && !isNaN(val)) mapX.set(d.split('T')[0], val);
+              });
+
+              setLogs([`Parsed CSV: Found ${mapY.size} points for Y, ${mapX.size} points for X. Extrapolating dates...`]);
+              
+              // Align by dates keeping overlapping range
+              const allDates = Array.from(new Set([...mapY.keys(), ...mapX.keys()])).sort();
+              for (const d of allDates) {
+                  if (d >= period1 && d <= period2 && mapY.has(d) && mapX.has(d)) {
+                      datesArr.push(d);
+                      yArr.push(mapY.get(d));
+                      xArr.push(mapX.get(d));
+                      bArr.push(mapX.get(d)); // Just mock benchmark with X for CSV to prevent break
+                  }
+              }
           }
-          
-          const data = await res.json();
-          const yArr = data.y;
-          const xArr = data.x;
-          const datesArr = data.dates;
           
           if (xArr.length < 15 || yArr.length < 15) {
               throw new Error(`Not enough historical data points found (need >= 15, got ${xArr.length}).`);
@@ -82,12 +153,19 @@ export default function App() {
           
           setFetchedDataY(yArr);
           setFetchedDataX(xArr);
+          setFetchedDataB(bArr);
           setFetchedDates(datesArr);
           
-          setLogs(prev => [...prev, `Data fetched: ${xArr.length} trading days. Running Diagnostics...`]);
+          setLogs(prev => [...prev, `Data aligned: ${xArr.length} trading days. Running Diagnostics...`]);
 
           // Run Cointegration check in Pyodide
-          const cointRes = await checkCointegration(yArr, xArr);
+          const cointRes = await checkCointegration(yArr, xArr, {
+              betaMode,
+              betaWindow: parseInt(betaWindow) || 60,
+              zscoreWindow: parseInt(zscoreWindow) || 20,
+              leverage: parseFloat(leverage) || 1,
+              transactionCost: transactionCost / 100
+          });
           setResult(cointRes);
       } catch (err: any) {
           setErrorMsg(err.message || 'An error occurred during verification.');
@@ -103,11 +181,22 @@ export default function App() {
       y: fetchedDataY[i]
   })) : [];
 
-  const residualChartData = result ? result.eg_y_on_x.residuals.map((r, i) => ({
+  const residualChartData = result ? (result.backtest?.spread_series || result.eg_y_on_x.residuals).map((r, i) => ({
       index: fetchedDates[i] || i,
       residual: r,
       zScore: result.backtest?.z_score[i] || 0,
   })) : [];
+
+  const equityChartData = result && result.backtest && fetchedDataB.length > 0 ? result.backtest.cumulative_returns.map((val, i) => {
+      const b0 = fetchedDataB[0];
+      const benchmarkCumRet = b0 ? (fetchedDataB[i] / b0) : 1; 
+
+      return {
+          index: fetchedDates[i] || i,
+          strategy: val,
+          benchmark: benchmarkCumRet
+      };
+  }) : [];
 
 
   return (
@@ -146,24 +235,83 @@ export default function App() {
                     </h2>
                     
                     <div className="space-y-4">
-                        <div>
-                            <label className="text-[10px] uppercase block mb-1 font-bold">Asset A (Dependent Variable Y)</label>
-                            <input type="text"
-                                value={tickerY}
-                                onChange={(e) => setTickerY(e.target.value)}
-                                className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
-                                placeholder="e.g. GLD"
-                            />
+                        <div className="flex gap-2 p-1 bg-stone-300">
+                            <button 
+                                onClick={() => setDataSource('yahoo')}
+                                className={cn("flex-1 py-1 text-[10px] uppercase font-bold tracking-widest transition-colors", dataSource === 'yahoo' ? "bg-stone-900 text-white" : "text-stone-600 hover:text-stone-900")}
+                            >API (Yahoo)</button>
+                            <button 
+                                onClick={() => setDataSource('csv')}
+                                className={cn("flex-1 py-1 text-[10px] uppercase font-bold tracking-widest transition-colors flex items-center justify-center gap-1", dataSource === 'csv' ? "bg-stone-900 text-white" : "text-stone-600 hover:text-stone-900")}
+                            ><FileBarChart className="w-3 h-3"/> CSV Upload</button>
                         </div>
                         
-                        <div>
-                            <label className="text-[10px] uppercase block mb-1 font-bold">Asset B (Independent Variable X)</label>
-                            <input type="text"
-                                value={tickerX}
-                                onChange={(e) => setTickerX(e.target.value)}
-                                className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
-                                placeholder="e.g. SLV"
-                            />
+                        {dataSource === 'yahoo' ? (
+                            <>
+                                <div>
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Asset A (Dependent Variable Y)</label>
+                                    <input type="text"
+                                        value={tickerY}
+                                        onChange={(e) => setTickerY(e.target.value)}
+                                        className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
+                                        placeholder="e.g. GLD"
+                                    />
+                                </div>
+                                
+                                <div>
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Asset B (Independent Variable X)</label>
+                                    <input type="text"
+                                        value={tickerX}
+                                        onChange={(e) => setTickerX(e.target.value)}
+                                        className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
+                                        placeholder="e.g. SLV"
+                                    />
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div>
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Asset A (Dependent Variable Y) - CSV</label>
+                                    <input type="file" accept=".csv"
+                                        onChange={(e) => setCsvDataY(e.target.files?.[0] || null)}
+                                        className="w-full bg-transparent border border-stone-400 p-1.5 font-mono text-xs outline-none focus:border-stone-900 transition-all text-stone-600 file:bg-stone-900 file:text-white file:border-0 file:px-3 file:py-1 file:mr-2 file:text-[10px] file:uppercase file:font-bold file:cursor-pointer"
+                                    />
+                                </div>
+                                
+                                <div>
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Asset B (Independent Variable X) - CSV</label>
+                                    <input type="file" accept=".csv"
+                                        onChange={(e) => setCsvDataX(e.target.files?.[0] || null)}
+                                        className="w-full bg-transparent border border-stone-400 p-1.5 font-mono text-xs outline-none focus:border-stone-900 transition-all text-stone-600 file:bg-stone-900 file:text-white file:border-0 file:px-3 file:py-1 file:mr-2 file:text-[10px] file:uppercase file:font-bold file:cursor-pointer"
+                                    />
+                                </div>
+                            </>
+                        )}
+                    </div>
+                    
+                    <div className="mt-6 pt-6 border-t border-stone-400/50">
+                        <h2 className="font-serif italic text-lg mb-4 flex justify-between items-center text-stone-900">
+                            Data Period
+                        </h2>
+                        <div className="space-y-4">
+                            <div className="flex gap-4">
+                                <div className="flex-1">
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Start Date</label>
+                                    <input type="date"
+                                        value={period1}
+                                        onChange={(e) => setPeriod1(e.target.value)}
+                                        className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all font-bold text-stone-600 uppercase"
+                                    />
+                                </div>
+                                <div className="flex-1">
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">End Date</label>
+                                    <input type="date"
+                                        value={period2}
+                                        onChange={(e) => setPeriod2(e.target.value)}
+                                        className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all font-bold text-stone-600 uppercase"
+                                    />
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -176,6 +324,74 @@ export default function App() {
                             <button onClick={() => loadPreset('EWA', 'EWC')} className="flex-1 bg-stone-200 hover:bg-stone-300 border border-stone-400 text-[10px] font-mono uppercase font-bold py-2 transition-colors text-stone-900">
                                 EWA / EWC
                             </button>
+                        </div>
+                    </div>
+
+                    <div className="mt-6 pt-6 border-t border-stone-400/50">
+                        <h2 className="font-serif italic text-lg mb-4 flex justify-between items-center text-stone-900">
+                            Backtest Settings
+                        </h2>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="text-[10px] uppercase block mb-1 font-bold">Hedge Ratio (&beta;) Mode</label>
+                                <div className="flex gap-2 text-[10px] font-mono uppercase font-bold">
+                                    <button 
+                                        className={cn("flex-1 py-1.5 border transition-colors", betaMode === 'constant' ? "bg-stone-900 text-white border-stone-900" : "bg-transparent text-stone-600 border-stone-400 hover:border-stone-900")} 
+                                        onClick={() => setBetaMode('constant')}
+                                    >Constant</button>
+                                    <button 
+                                        className={cn("flex-1 py-1.5 border transition-colors", betaMode === 'rolling' ? "bg-stone-900 text-white border-stone-900" : "bg-transparent text-stone-600 border-stone-400 hover:border-stone-900")} 
+                                        onClick={() => setBetaMode('rolling')}
+                                    >Rolling</button>
+                                </div>
+                            </div>
+
+                            {betaMode === 'rolling' && (
+                                <div>
+                                    <label className="text-[10px] uppercase block mb-1 font-bold">Beta Rolling Window (Days)</label>
+                                    <input type="number"
+                                        value={betaWindow}
+                                        onChange={(e) => setBetaWindow(e.target.value)}
+                                        className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
+                                        placeholder="60"
+                                    />
+                                </div>
+                            )}
+
+                            <div>
+                                <label className="text-[10px] uppercase block mb-1 font-bold">Z-Score Rolling Window (Days)</label>
+                                <input type="number"
+                                    value={zscoreWindow}
+                                    onChange={(e) => setZscoreWindow(e.target.value)}
+                                    className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
+                                    placeholder="20"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="text-[10px] uppercase block mb-1 font-bold">Leverage (x)</label>
+                                <input type="number"
+                                    value={leverage}
+                                    onChange={(e) => setLeverage(e.target.value)}
+                                    className="w-full bg-transparent border border-stone-400 p-2 font-mono text-sm outline-none focus:border-stone-900 transition-all"
+                                    placeholder="1"
+                                    min="1"
+                                    step="0.1"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="text-[10px] uppercase flex justify-between mb-1 font-bold">
+                                    <span>Transaction Cost / Trade</span>
+                                    <span>{transactionCost.toFixed(2)}%</span>
+                                </label>
+                                <input type="range"
+                                    min="0" max="1" step="0.05"
+                                    value={transactionCost}
+                                    onChange={(e) => setTransactionCost(parseFloat(e.target.value))}
+                                    className="w-full accent-stone-900"
+                                />
+                            </div>
                         </div>
                     </div>
 
@@ -376,7 +592,7 @@ export default function App() {
                                 <h3 className="text-[10px] uppercase tracking-widest font-bold mb-4 flex items-center gap-2">
                                    <span className="px-2 py-0.5 bg-stone-900 text-white">04</span> Backtest (Pairs Strategy: Y~X Spread)
                                 </h3>
-                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
                                     <div className="border border-stone-900 p-4 relative">
                                         <div className="text-[10px] uppercase font-bold opacity-40 mb-1">Total Return</div>
                                         <div className={cn("text-3xl font-serif text-stone-900", result.backtest.total_return >= 0 ? "text-green-700" : "text-red-700")}>
@@ -393,6 +609,18 @@ export default function App() {
                                         <div className="text-[10px] uppercase font-bold opacity-40 mb-1">Max Drawdown</div>
                                         <div className="text-3xl font-serif text-red-700">
                                             {(result.backtest.max_drawdown * 100).toFixed(2)}%
+                                        </div>
+                                    </div>
+                                    <div className="border border-stone-900 p-4 relative">
+                                        <div className="text-[10px] uppercase font-bold opacity-40 mb-1">Max DD Duration</div>
+                                        <div className="text-3xl font-serif text-stone-900">
+                                            {Math.round(result.backtest.max_drawdown_duration)} <span className="text-lg text-stone-500">days</span>
+                                        </div>
+                                    </div>
+                                    <div className="border border-stone-900 p-4 relative">
+                                        <div className="text-[10px] uppercase font-bold opacity-40 mb-1"># Trades</div>
+                                        <div className="text-3xl font-serif text-stone-900">
+                                            {result.backtest.trades_count}
                                         </div>
                                     </div>
                                 </div>
@@ -449,6 +677,29 @@ export default function App() {
                                         />
                                         <Line yAxisId="left" type="monotone" name="Spread" dataKey="residual" stroke="#1c1917" strokeWidth={1.5} dot={false} isAnimationActive={false} />
                                         <Line yAxisId="right" type="stepAfter" name="Z-Score" dataKey="zScore" stroke="#dc2626" strokeWidth={1} dot={false} opacity={0.7} isAnimationActive={false} />
+                                    </LineChart>
+                                </ResponsiveContainer>
+                            </div>
+                        </div>
+                        {/* 3. Equity Curve Comparison */}
+                        <div className="p-6 border border-stone-900 bg-transparent flex-1">
+                           <h3 className="text-[10px] uppercase tracking-widest font-bold mb-2 flex items-center gap-2">
+                               <span className="px-2 py-0.5 bg-stone-900 text-white">07</span> Equity Curve vs QQQ
+                           </h3>
+                           <p className="text-[10px] font-mono text-stone-500 mb-6 italic">Comparing cummulative returns of Strategy vs QQQ Buy & Hold</p>
+                            <div className="h-64 w-full border-t border-stone-300 pt-4 relative">
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <LineChart data={equityChartData} margin={{ top: 5, right: 0, left: -20, bottom: 0 }}>
+                                        <CartesianGrid strokeDasharray="4" stroke="#d6d3d1" vertical={false} />
+                                        <XAxis dataKey="index" stroke="#1c1917" fontSize={10} tickLine={false} axisLine={false} fontFamily="monospace" />
+                                        <YAxis stroke="#1c1917" fontSize={10} tickLine={false} axisLine={false} domain={['auto', 'auto']} fontFamily="monospace" />
+                                        <ReferenceLine y={1} stroke="#1c1917" strokeDasharray="3 3" strokeWidth={0.5} />
+                                        <RechartsTooltip 
+                                            contentStyle={{ backgroundColor: '#f5f5f4', borderColor: '#1c1917', borderRadius: '0px', fontFamily: 'monospace', fontSize: '10px' }}
+                                            itemStyle={{ color: '#1c1917' }}
+                                        />
+                                        <Line type="monotone" name="Strategy" dataKey="strategy" stroke="#1c1917" strokeWidth={2} dot={false} isAnimationActive={false} />
+                                        <Line type="monotone" name="QQQ Benchmark" dataKey="benchmark" stroke="#0ea5e9" strokeWidth={1.5} dot={false} isAnimationActive={false} />
                                     </LineChart>
                                 </ResponsiveContainer>
                             </div>
